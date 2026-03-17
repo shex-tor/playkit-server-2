@@ -11,7 +11,6 @@ const axiosRetry = require('axios-retry').default;
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const NodeCache = require('node-cache');
-const puppeteer = require('puppeteer');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const os = require('os');
@@ -504,22 +503,11 @@ class EmbedExtractor {
 }
 
 // =============================================================================
-// SOURCE 3: SUPER EMBED EXTRACTOR (with Puppeteer for dynamic content)
+// SOURCE 3: SUPER EMBED EXTRACTOR (axios/cheerio — no Puppeteer)
 // =============================================================================
 class SuperEmbedExtractor {
     constructor() {
         this.name = 'superembed';
-        this.browser = null;
-    }
-
-    async getBrowser() {
-        if (!this.browser) {
-            this.browser = await puppeteer.launch({
-                args: ['--no-sandbox', '--disable-setuid-sandbox'],
-                headless: 'new'
-            });
-        }
-        return this.browser;
     }
 
     async extract(movieId, title, year) {
@@ -532,65 +520,57 @@ class SuperEmbedExtractor {
 
         for (const url of urls) {
             try {
-                const browser = await this.getBrowser();
-                const page = await browser.newPage();
-                
-                await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
-                await page.setExtraHTTPHeaders({
-                    'Accept-Language': 'en-US,en;q=0.9'
+                const response = await axiosWithProxy.get(url, {
+                    headers: {
+                        'Referer': 'https://www.google.com/',
+                        'Accept-Language': 'en-US,en;q=0.9'
+                    }
                 });
 
-                // Intercept network requests to catch video sources
-                await page.setRequestInterception(true);
-                page.on('request', request => {
-                    const url = request.url();
-                    if (url.match(/\.(mp4|m3u8|ts)/) || url.includes('video') || url.includes('stream')) {
+                const $ = cheerio.load(response.data);
+
+                // Extract from video/source elements
+                $('video source, video[src]').each((i, el) => {
+                    const src = $(el).attr('src') || $(el).parent().attr('src');
+                    if (src && src.match(/\.(mp4|m3u8)/i)) {
                         links.push({
-                            url: url,
-                            quality: this.detectQuality(url),
-                            type: url.includes('.m3u8') ? 'hls' : 'mp4',
+                            url: src,
+                            quality: this.detectQuality(src),
+                            type: src.includes('.m3u8') ? 'hls' : 'mp4',
                             source: 'superembed'
                         });
                     }
-                    request.continue();
                 });
 
-                await page.goto(url, { waitUntil: 'networkidle0', timeout: 15000 });
-                
-                // Wait for potential dynamic content
-                await page.waitForTimeout(3000);
-                
-                // Extract from page content
-                const pageLinks = await page.evaluate(() => {
-                    const found = [];
-                    
-                    // Check video elements
-                    document.querySelectorAll('video source, video').forEach(el => {
-                        const src = el.src || el.getAttribute('src');
-                        if (src) found.push(src);
-                    });
-                    
-                    // Check script variables
-                    const scripts = document.querySelectorAll('script');
-                    scripts.forEach(script => {
-                        const content = script.textContent || '';
-                        const matches = content.match(/https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*/g);
-                        if (matches) matches.forEach(m => found.push(m));
-                    });
-                    
-                    return found;
+                // Extract from data attributes
+                $('[data-src],[data-url],[data-video],[data-file]').each((i, el) => {
+                    const src = $(el).attr('data-src') || $(el).attr('data-url') ||
+                                $(el).attr('data-video') || $(el).attr('data-file');
+                    if (src && src.match(/https?:\/\//)) {
+                        links.push({
+                            url: src,
+                            quality: this.detectQuality(src),
+                            type: src.includes('.m3u8') ? 'hls' : 'mp4',
+                            source: 'superembed'
+                        });
+                    }
                 });
 
-                pageLinks.forEach(url => {
-                    links.push({
-                        url: url,
-                        quality: this.detectQuality(url),
-                        type: url.includes('.m3u8') ? 'hls' : 'mp4',
-                        source: 'superembed'
-                    });
+                // Scan inline scripts for video URLs
+                $('script').each((i, el) => {
+                    const content = $(el).html() || '';
+                    const matches = content.match(/https?:\/\/[^"'\s\\]+\.(mp4|m3u8)[^"'\s\\]*/gi);
+                    if (matches) {
+                        matches.forEach(matchUrl => {
+                            links.push({
+                                url: matchUrl,
+                                quality: this.detectQuality(matchUrl),
+                                type: matchUrl.includes('.m3u8') ? 'hls' : 'mp4',
+                                source: 'superembed'
+                            });
+                        });
+                    }
                 });
-
-                await page.close();
 
             } catch (error) {
                 continue; // Try next URL
@@ -624,13 +604,6 @@ class SuperEmbedExtractor {
         if (links.some(l => l.quality === '1080p')) return '1080p';
         if (links.some(l => l.quality === '720p')) return '720p';
         return 'auto';
-    }
-
-    async cleanup() {
-        if (this.browser) {
-            await this.browser.close();
-            this.browser = null;
-        }
     }
 }
 
@@ -1303,11 +1276,6 @@ setInterval(refreshCache, 60 * 60 * 1000);
 process.on('SIGINT', async () => {
     logInfo('SHUTDOWN', 'Saving cache and cleaning up...');
     saveCacheToDisk();
-    
-    // Cleanup browser instances
-    if (extractor.sources[2]?.browser) {
-        await extractor.sources[2].cleanup();
-    }
     
     process.exit(0);
 });
