@@ -97,26 +97,50 @@ axiosRetry(http, {
 const YTDLP_BIN = process.env.YTDLP_PATH || '/usr/local/bin/yt-dlp';
 
 async function ensureYtDlp() {
-  // Check if already available
-  for (const bin of [YTDLP_BIN, 'yt-dlp', '/usr/bin/yt-dlp']) {
-    try { await execFileAsync(bin, ['--version']); logger.info('YTDLP', `Found at ${bin} ✅`); return; } catch {}
+  const checks = [
+    YTDLP_BIN, 'yt-dlp', '/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp',
+    '/nix/var/nix/profiles/default/bin/yt-dlp',
+    '/root/.nix-profile/bin/yt-dlp',
+    path.join(os.homedir(), '.nix-profile/bin/yt-dlp'),
+    path.join(os.homedir(), '.local/bin/yt-dlp'),
+  ];
+
+  for (const bin of checks) {
+    try {
+      const { stdout } = await execFileAsync(bin, ['--version']);
+      logger.info('YTDLP', `Found at ${bin} — ${stdout.trim()} ✅`);
+      return;
+    } catch {}
   }
 
-  logger.info('YTDLP', 'Not found — installing...');
+  logger.warn('YTDLP', 'Not found in any known location — attempting install…');
+
+  // Try pip (with --break-system-packages for newer Python envs)
   try {
-    await execAsync('pip3 install -q yt-dlp 2>/dev/null || pip install -q yt-dlp 2>/dev/null');
+    await execAsync('pip3 install --upgrade --break-system-packages yt-dlp 2>&1 || pip3 install --upgrade yt-dlp 2>&1 || pip install --upgrade yt-dlp 2>&1');
     logger.info('YTDLP', 'Installed via pip ✅');
     return;
-  } catch {}
+  } catch (e) {
+    logger.warn('YTDLP', `pip failed: ${e.message}`);
+  }
 
+  // Fallback: download binary directly
   try {
     await execAsync(
-      `curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ${YTDLP_BIN} && chmod +x ${YTDLP_BIN}`
+      `curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp`
     );
-    logger.info('YTDLP', 'Installed via curl ✅');
-  } catch (err) {
-    logger.error('YTDLP', err, { note: 'YouTube source will not work without yt-dlp' });
+    const { stdout } = await execFileAsync('/usr/local/bin/yt-dlp', ['--version']);
+    logger.info('YTDLP', `Installed via curl — ${stdout.trim()} ✅`);
+    return;
+  } catch (e) {
+    logger.warn('YTDLP', `curl failed: ${e.message}`);
   }
+
+  logger.error('YTDLP', new Error(
+    'yt-dlp could not be installed automatically.\n' +
+    '→ Fix: add nixpacks.toml to your repo with nixPkgs = ["yt-dlp"]\n' +
+    '→ Or set YTDLP_PATH env var to the binary location'
+  ));
 }
 
 // =============================================================================
@@ -237,7 +261,17 @@ class YouTubeSource {
   }
 
   async _findBin() {
-    for (const b of [YTDLP_BIN, 'yt-dlp', '/usr/bin/yt-dlp', path.join(os.homedir(), '.local/bin/yt-dlp')]) {
+    const candidates = [
+      YTDLP_BIN,                                          // env override
+      'yt-dlp',                                           // PATH lookup
+      '/usr/local/bin/yt-dlp',                            // curl install
+      '/usr/bin/yt-dlp',                                  // system
+      '/nix/var/nix/profiles/default/bin/yt-dlp',        // Nix global
+      '/root/.nix-profile/bin/yt-dlp',                   // Nix root profile
+      path.join(os.homedir(), '.nix-profile/bin/yt-dlp'),// Nix user profile
+      path.join(os.homedir(), '.local/bin/yt-dlp'),      // pip user install
+    ];
+    for (const b of candidates) {
       try { await execFileAsync(b, ['--version']); return b; } catch {}
     }
     return null;
