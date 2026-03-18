@@ -162,109 +162,166 @@ const axiosWithProxy = axios.create({
 
 // =============================================================================
 // FZMOVIES EXTRACTOR (Primary Source)
+// FZMovies flow: POST search → movie-about.php → moviesdownload.php → file links
 // =============================================================================
 class FZMoviesExtractor {
     constructor() {
         this.name = 'fzmovies';
         this.base = 'https://www.fzmovies.net';
+        this.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.fzmovies.net/'
+        };
     }
 
     async extract(title, year) {
         try {
-            const query = encodeURIComponent(title);
+            // Step 1: POST search — FZMovies uses a form POST for search
+            const params = new URLSearchParams();
+            params.append('searchname', title);
+            params.append('searchby', 'Name');
+            params.append('submit', 'Search');
 
-            // Step 1: Search FZMovies
-            const searchRes = await axiosWithProxy.get(
-                `${this.base}/index.php?s=${query}&action=2&y=${year || ''}`,
-                { headers: { Referer: this.base } }
-            );
-            const $ = cheerio.load(searchRes.data);
-
-            // Step 2: Find movie page link
-            let moviePageUrl = null;
-            $('a[href*="movie-about.php"]').each((i, el) => {
-                if (!moviePageUrl) {
-                    const href = $(el).attr('href');
-                    if (href) moviePageUrl = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
-                }
-            });
-
-            if (!moviePageUrl) {
-                // Fallback: search without year
-                const altRes = await axiosWithProxy.get(
-                    `${this.base}/index.php?s=${query}&action=2`,
-                    { headers: { Referer: this.base } }
-                );
-                const $2 = cheerio.load(altRes.data);
-                $2('a[href*="movie-about.php"]').each((i, el) => {
-                    if (!moviePageUrl) {
-                        const href = $2(el).attr('href');
-                        if (href) moviePageUrl = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
+            const searchRes = await axiosWithProxy.post(
+                `${this.base}/index.php`,
+                params.toString(),
+                {
+                    headers: {
+                        ...this.headers,
+                        'Content-Type': 'application/x-www-form-urlencoded'
                     }
-                });
-            }
-
-            if (!moviePageUrl) return { links: [] };
-
-            // Step 3: Get movie page to find download page link
-            const movieRes = await axiosWithProxy.get(moviePageUrl, {
-                headers: { Referer: this.base }
-            });
-            const $m = cheerio.load(movieRes.data);
-
-            let downloadPageUrl = null;
-            $m('a[href*="download.php"], a[href*="movie-download"]').each((i, el) => {
-                if (!downloadPageUrl) {
-                    const href = $m(el).attr('href');
-                    if (href) downloadPageUrl = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
                 }
-            });
+            );
 
-            if (!downloadPageUrl) return { links: [] };
-
-            // Step 4: Get download page with quality options
-            const dlRes = await axiosWithProxy.get(downloadPageUrl, {
-                headers: { Referer: moviePageUrl }
-            });
-            const $d = cheerio.load(dlRes.data);
+            const $ = cheerio.load(searchRes.data);
             const links = [];
 
-            // Collect all download links
-            $d('a[href*="download.php"], a[href*="dload.php"], a[href*=".mp4"]').each((i, el) => {
-                const href = $d(el).attr('href');
-                const text = $d(el).text().trim();
-                if (!href) return;
+            // Step 2: Find movie-about.php link from search results
+            // Results appear as <a href="movie-about.php?fid=...">
+            let moviePageUrl = null;
+            $('a[href*="movie-about.php"]').each((i, el) => {
+                if (moviePageUrl) return;
+                const href = $(el).attr('href') || '';
+                // Optionally match year if present in link text or nearby text
+                const text = $(el).closest('li, div, td').text();
+                const yearMatch = !year || text.includes(String(year)) || text.includes(String(year - 1));
+                if (yearMatch || i === 0) {
+                    moviePageUrl = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
+                }
+            });
+
+            // Fallback: just take first result
+            if (!moviePageUrl) {
+                const firstHref = $('a[href*="movie-about.php"]').first().attr('href');
+                if (firstHref) moviePageUrl = firstHref.startsWith('http') ? firstHref : `${this.base}/${firstHref.replace(/^\//, '')}`;
+            }
+
+            if (!moviePageUrl) {
+                logInfo('FZMOVIES', `No results found for "${title}"`);
+                return { links: [] };
+            }
+
+            logInfo('FZMOVIES', `Found movie page: ${moviePageUrl}`);
+
+            // Step 3: Open movie-about.php to get moviesdownload.php link
+            const movieRes = await axiosWithProxy.get(moviePageUrl, { headers: this.headers });
+            const $m = cheerio.load(movieRes.data);
+
+            let downloadListUrl = null;
+            $m('a[href*="moviesdownload.php"], a[href*="download.php"]').each((i, el) => {
+                if (downloadListUrl) return;
+                const href = $m(el).attr('href') || '';
+                downloadListUrl = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
+            });
+
+            if (!downloadListUrl) {
+                logInfo('FZMOVIES', 'No download list link found on movie page');
+                return { links: [] };
+            }
+
+            logInfo('FZMOVIES', `Download list URL: ${downloadListUrl}`);
+
+            // Step 4: Open moviesdownload.php — shows quality rows
+            const dlListRes = await axiosWithProxy.get(downloadListUrl, {
+                headers: { ...this.headers, Referer: moviePageUrl }
+            });
+            const $dl = cheerio.load(dlListRes.data);
+
+            // Step 5: Each quality row has a link to a file page (dcrypt.php or similar)
+            // Collect those per-quality links first
+            const qualityPageLinks = [];
+            $dl('a[href*="dcrypt.php"], a[href*="download3.php"], a[href*="dlink"]').each((i, el) => {
+                const href = $dl(el).attr('href') || '';
+                const text = $dl(el).closest('tr, li, div').text().trim();
                 const url = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
-                if (url === downloadPageUrl) return; // skip self
+                qualityPageLinks.push({ url, text });
+            });
+
+            // Also grab direct .mp4 links if present
+            $dl('a[href$=".mp4"], a[href*=".mp4?"]').each((i, el) => {
+                const href = $dl(el).attr('href') || '';
+                const text = $dl(el).text().trim() || $dl(el).closest('tr').text().trim();
+                const url = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
                 links.push({
                     url,
                     quality: this.detectQuality(text + ' ' + href),
                     type: 'mp4',
                     source: 'fzmovies',
-                    label: text || null
+                    label: text.slice(0, 80)
                 });
             });
 
-            // Also check table rows
-            $d('tr').each((i, el) => {
-                const rowText = $d(el).text();
-                const anchor = $d(el).find('a[href]').first();
-                if (anchor.length && (rowText.includes('MB') || rowText.includes('GB') || rowText.includes('720') || rowText.includes('1080'))) {
-                    const href = anchor.attr('href');
-                    if (href && !href.includes('movie-about')) {
-                        const url = href.startsWith('http') ? href : `${this.base}/${href.replace(/^\//, '')}`;
-                        links.push({
-                            url,
-                            quality: this.detectQuality(rowText),
-                            type: 'mp4',
-                            source: 'fzmovies',
-                            label: rowText.trim().slice(0, 80)
+            // Step 6: For each quality page link, follow it to get the real download URL
+            for (const { url: qUrl, text: qText } of qualityPageLinks.slice(0, 6)) {
+                try {
+                    const qRes = await axiosWithProxy.get(qUrl, {
+                        headers: { ...this.headers, Referer: downloadListUrl }
+                    });
+                    const $q = cheerio.load(qRes.data);
+
+                    // The final page usually has a direct download link or meta refresh
+                    let finalUrl = null;
+
+                    // Check meta refresh
+                    const metaRefresh = $q('meta[http-equiv="refresh"]').attr('content') || '';
+                    const metaMatch = metaRefresh.match(/url=([^"'\s]+)/i);
+                    if (metaMatch) finalUrl = metaMatch[1];
+
+                    // Check anchor tags for mp4 or download links
+                    if (!finalUrl) {
+                        $q('a[href*=".mp4"], a[href*="download"], a.downloadbtn, a[href*="mediafire"], a[href*="gofile"]').each((i, el) => {
+                            if (!finalUrl) finalUrl = $q(el).attr('href');
                         });
                     }
-                }
-            });
 
-            return { links: this.deduplicateLinks(links) };
+                    // Check for script-embedded URLs
+                    if (!finalUrl) {
+                        $q('script').each((i, el) => {
+                            const src = $q(el).html() || '';
+                            const match = src.match(/https?:\/\/[^"'\s]+\.mp4[^"'\s]*/i);
+                            if (match && !finalUrl) finalUrl = match[0];
+                        });
+                    }
+
+                    if (finalUrl) {
+                        links.push({
+                            url: finalUrl.startsWith('http') ? finalUrl : `${this.base}/${finalUrl.replace(/^\//, '')}`,
+                            quality: this.detectQuality(qText + ' ' + finalUrl),
+                            type: 'mp4',
+                            source: 'fzmovies',
+                            label: qText.slice(0, 80)
+                        });
+                    }
+                } catch (e) {
+                    logError('FZMOVIES_STEP6', e, { url: qUrl });
+                }
+            }
+
+            const deduped = this.deduplicateLinks(links);
+            logInfo('FZMOVIES', `Found ${deduped.length} links for "${title}"`);
+            return { links: deduped };
 
         } catch (err) {
             logError('FZMOVIES', err, { title, year });
@@ -449,6 +506,44 @@ const extractor = new LinkExtractor();
 // =============================================================================
 // API ENDPOINTS
 // =============================================================================
+
+// Debug endpoint — test FZMovies scraping live (remove in production)
+app.get('/api/debug/fzmovies', async (req, res) => {
+    const title = req.query.title || 'Avengers';
+    const year  = req.query.year  || '2012';
+    const log   = [];
+    try {
+        const fz = new FZMoviesExtractor();
+
+        // Step 1: POST search
+        log.push('Step 1: POST search for: ' + title);
+        const params = new URLSearchParams();
+        params.append('searchname', title);
+        params.append('searchby', 'Name');
+        params.append('submit', 'Search');
+        const searchRes = await axiosWithProxy.post(
+            `${fz.base}/index.php`, params.toString(),
+            { headers: { ...fz.headers, 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
+        log.push('Search status: ' + searchRes.status);
+
+        const $ = cheerio.load(searchRes.data);
+        const movieLinks = [];
+        $('a[href*="movie-about.php"]').each((i, el) => {
+            movieLinks.push({ href: $(el).attr('href'), text: $(el).text().trim() });
+        });
+        log.push('Movie links found: ' + JSON.stringify(movieLinks.slice(0, 5)));
+
+        const result = await fz.extract(title, year);
+        log.push('Final links count: ' + result.links.length);
+        log.push('Links: ' + JSON.stringify(result.links.slice(0, 5)));
+
+        res.json({ success: true, log, links: result.links });
+    } catch (e) {
+        log.push('ERROR: ' + e.message);
+        res.json({ success: false, log, error: e.message });
+    }
+});
 
 // Health check
 app.get('/api/health', (req, res) => {
