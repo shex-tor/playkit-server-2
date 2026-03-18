@@ -172,37 +172,67 @@ class YouTubeSource {
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
     logger.info('YOUTUBE', `Extracting formats from ${videoUrl}`);
 
-    const { stdout } = await execFileAsync(bin, [
-      videoUrl,
-      '--dump-json', '--no-playlist',
-      '--quiet', '--no-warnings',
-      '--extractor-args', 'youtube:skip=dash',
-    ], { timeout: 45_000 });
+    let stdout, stderr;
+    try {
+      ({ stdout, stderr } = await execFileAsync(bin, [
+        videoUrl,
+        '--dump-json',
+        '--no-playlist',
+        '--no-warnings',
+      ], { timeout: 45_000 }));
+    } catch (err) {
+      throw new Error(`yt-dlp failed: ${err.stderr || err.message}`);
+    }
 
-    const info    = JSON.parse(stdout);
-    const formats = (info.formats || [])
-      .filter(f => f.url && f.ext !== 'webm' && f.vcodec && f.vcodec !== 'none');
+    if (!stdout || !stdout.trim()) {
+      throw new Error('yt-dlp returned no output — video may be unavailable or age-restricted');
+    }
 
-    // Prefer formats that have audio merged in, sorted by resolution desc
-    formats.sort((a, b) => {
-      const aAudio = (a.acodec && a.acodec !== 'none') ? 1 : 0;
-      const bAudio = (b.acodec && b.acodec !== 'none') ? 1 : 0;
-      if (aAudio !== bAudio) return bAudio - aAudio;
-      return (b.height || 0) - (a.height || 0);
-    });
+    let info;
+    try {
+      const jsonStart = stdout.indexOf('{');
+      if (jsonStart === -1) throw new Error('No JSON in yt-dlp output');
+      info = JSON.parse(stdout.slice(jsonStart));
+    } catch (err) {
+      throw new Error(`Failed to parse yt-dlp output: ${err.message}`);
+    }
+
+    const allFormats = info.formats || [];
+
+    // Prefer combined mp4 (video+audio merged), fall back to video-only mp4
+    const combined = allFormats.filter(f =>
+      f.url &&
+      f.ext === 'mp4' &&
+      f.vcodec && f.vcodec !== 'none' &&
+      f.acodec && f.acodec !== 'none'
+    );
+    const videoOnly = allFormats.filter(f =>
+      f.url &&
+      f.ext === 'mp4' &&
+      f.vcodec && f.vcodec !== 'none'
+    );
+
+    const formats = (combined.length > 0 ? combined : videoOnly)
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+    if (formats.length === 0) {
+      throw new Error('No downloadable MP4 formats found for this video');
+    }
+
+    const ytHeaders = {
+      'User-Agent': allFormats[0]?.http_headers?.['User-Agent'] || randUA(),
+      Referer:      'https://www.youtube.com/',
+      Origin:       'https://www.youtube.com',
+    };
 
     return formats.slice(0, 5).map(f => ({
       url:     f.url,
       quality: this._hq(f.height),
-      type:    (f.protocol || '').includes('m3u8') ? 'hls' : 'mp4',
+      type:    'mp4',
       source:  this.name,
       videoId,
       title:   info.title,
-      headers: {
-        'User-Agent': f.http_headers?.['User-Agent'] || randUA(),
-        Referer:      f.http_headers?.Referer        || 'https://www.youtube.com/',
-        Origin:       'https://www.youtube.com',
-      },
+      headers: ytHeaders,
     }));
   }
 
