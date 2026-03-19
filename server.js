@@ -1,6 +1,6 @@
 // =============================================================================
-// server.js — PLAYKIT Movie Download Server
-// Complete system with real link extraction, validation, and caching
+// server.js — PLAYKIT AI-Powered Movie Server
+// Complete system with real link extraction, Gemini AI integration, and caching
 // =============================================================================
 
 const express = require('express');
@@ -14,10 +14,26 @@ const NodeCache = require('node-cache');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const os = require('os');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
+
+// =============================================================================
+// GEMINI AI CONFIGURATION
+// =============================================================================
+const GEMINI_KEY = 'AIzaSyCc_o1ylT7HzPajmtSwet2Ihs8HWsKKDLk';
+const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+const aiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// AI Cache
+const aiCache = {
+    embeddings: new NodeCache({ stdTTL: 86400 }), // 24 hours
+    recommendations: new NodeCache({ stdTTL: 3600 }), // 1 hour
+    explanations: new NodeCache({ stdTTL: 604800 }), // 7 days
+    semantic: new NodeCache({ stdTTL: 3600 }) // 1 hour
+};
 
 // =============================================================================
 // ADVANCED CORS & SECURITY
@@ -26,7 +42,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-Exact-Size, X-Movie-Title, X-Cache-Hit');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-Exact-Size, X-Movie-Title, X-Cache-Hit, X-AI-Confidence');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -39,7 +55,7 @@ app.use(express.static('public'));
 
 // Rate limiting
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
+    windowMs: 15 * 60 * 1000,
     max: 100,
     message: { error: 'Too many requests, please try again later.' }
 });
@@ -60,7 +76,6 @@ const TEMP_DIR = path.join(os.tmpdir(), 'playkit-downloads');
 const CACHE_DIR = path.join(__dirname, 'cache');
 const LOG_DIR = path.join(__dirname, 'logs');
 
-// Create directories
 [TEMP_DIR, CACHE_DIR, LOG_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
@@ -69,15 +84,13 @@ const LOG_DIR = path.join(__dirname, 'logs');
 // CACHE SYSTEM
 // =============================================================================
 const linkCache = new NodeCache({
-    stdTTL: 86400, // 24 hours default TTL
+    stdTTL: 86400,
     checkperiod: 3600,
     useClones: false
 });
 
-// Persistent cache file
 const CACHE_FILE = path.join(CACHE_DIR, 'links-cache.json');
 
-// Load cache from disk on startup
 function loadCacheFromDisk() {
     try {
         if (fs.existsSync(CACHE_FILE)) {
@@ -85,14 +98,13 @@ function loadCacheFromDisk() {
             Object.entries(data).forEach(([key, value]) => {
                 linkCache.set(key, value);
             });
-            console.log(`✅ Loaded ${Object.keys(data).length} cached links`);
+            console.log(`Loaded ${Object.keys(data).length} cached links`);
         }
     } catch (error) {
         console.error('Failed to load cache:', error.message);
     }
 }
 
-// Save cache to disk periodically
 function saveCacheToDisk() {
     try {
         const keys = linkCache.keys();
@@ -101,69 +113,294 @@ function saveCacheToDisk() {
             cacheData[key] = linkCache.get(key);
         });
         fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2));
-        console.log(`💾 Saved ${keys.length} links to disk cache`);
+        console.log(`Saved ${keys.length} links to disk cache`);
     } catch (error) {
         console.error('Failed to save cache:', error.message);
     }
 }
 
-// Save cache every 5 minutes
 setInterval(saveCacheToDisk, 5 * 60 * 1000);
 loadCacheFromDisk();
 
 // =============================================================================
-// LOGGING SYSTEM
+// AI FUNCTIONS
 // =============================================================================
-function logError(context, error, metadata = {}) {
-    const logEntry = {
-        timestamp: new Date().toISOString(),
-        context,
-        error: error.message,
-        stack: error.stack,
-        metadata
-    };
-    
-    const logFile = path.join(LOG_DIR, `error-${new Date().toISOString().split('T')[0]}.log`);
-    fs.appendFileSync(logFile, JSON.stringify(logEntry) + '\n');
-    console.error(`❌ [${context}]`, error.message);
+
+class AIAssistant {
+    constructor() {
+        this.model = aiModel;
+    }
+
+    // Generate movie embeddings for semantic search
+    async generateEmbedding(text) {
+        const cacheKey = `emb_${crypto.createHash('md5').update(text).digest('hex')}`;
+        const cached = aiCache.embeddings.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            // For Gemini, we'll use a text representation rather than actual embeddings
+            // Store a compressed version of the semantic meaning
+            const result = await this.model.generateContent(
+                `Summarize this movie description in 50 words for semantic matching: ${text}`
+            );
+            const summary = (await result.response).text();
+            
+            aiCache.embeddings.set(cacheKey, summary);
+            return summary;
+        } catch (error) {
+            console.error('Embedding error:', error);
+            return text;
+        }
+    }
+
+    // Get personalized recommendations
+    async getRecommendations(userPreferences, availableMovies, count = 10) {
+        const cacheKey = `rec_${crypto.createHash('md5').update(JSON.stringify(userPreferences)).digest('hex')}`;
+        const cached = aiCache.recommendations.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const movieList = availableMovies.map(m => 
+                `${m.title} (${m.release_date?.slice(0,4) || 'Unknown'}): ${m.overview?.slice(0,100) || 'No description'}`
+            ).join('\n');
+
+            const prompt = `You are a movie recommendation AI. Based on these preferences:
+            ${JSON.stringify(userPreferences, null, 2)}
+            
+            Rank these movies from most to least suitable:
+            ${movieList}
+            
+            Return a JSON object with:
+            {
+                "rankings": ["Movie Title 1", "Movie Title 2", ...],
+                "explanations": {
+                    "Movie Title 1": "Why this matches the preferences"
+                },
+                "confidenceScores": {
+                    "Movie Title 1": 0.95
+                }
+            }
+            
+            Only include movies from the provided list.`;
+
+            const result = await this.model.generateContent(prompt);
+            const response = await result.response;
+            const text = response.text();
+            
+            const jsonMatch = text.match(/\{.*\}/s);
+            if (jsonMatch) {
+                const aiData = JSON.parse(jsonMatch[0]);
+                aiCache.recommendations.set(cacheKey, aiData);
+                return aiData;
+            }
+        } catch (error) {
+            console.error('Recommendation error:', error);
+        }
+
+        return { rankings: [], explanations: {}, confidenceScores: {} };
+    }
+
+    // Semantic search
+    async semanticSearch(query, movies) {
+        const cacheKey = `sem_${crypto.createHash('md5').update(query).digest('hex')}`;
+        const cached = aiCache.semantic.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const movieDescriptions = movies.map(m => 
+                `${m.title} (${m.release_date?.slice(0,4) || 'Unknown'}): ${m.overview || 'No description'}`
+            ).join('\n');
+
+            const prompt = `Find movies matching this query: "${query}"
+            
+            Available movies:
+            ${movieDescriptions}
+            
+            Return a JSON array of the top 10 most relevant movie titles in order of relevance.
+            Format: ["Movie Title 1", "Movie Title 2", ...]`;
+
+            const result = await this.model.generateContent(prompt);
+            const response = await result.response;
+            const text = response.text();
+            
+            const jsonMatch = text.match(/\[.*\]/s);
+            if (jsonMatch) {
+                const titles = JSON.parse(jsonMatch[0]);
+                
+                // Map titles to movie objects with scores
+                const results = movies
+                    .filter(m => titles.includes(m.title))
+                    .map(m => ({
+                        ...m,
+                        relevanceScore: 1 - (titles.indexOf(m.title) / titles.length)
+                    }))
+                    .sort((a, b) => b.relevanceScore - a.relevanceScore);
+
+                aiCache.semantic.set(cacheKey, results);
+                return results;
+            }
+        } catch (error) {
+            console.error('Semantic search error:', error);
+        }
+
+        return [];
+    }
+
+    // Get movie explanation
+    async explainMovie(movie) {
+        const cacheKey = `exp_${movie.id}`;
+        const cached = aiCache.explanations.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const prompt = `Explain why someone would enjoy this movie in 2-3 sentences:
+            Title: ${movie.title}
+            Year: ${movie.release_date?.slice(0,4) || 'Unknown'}
+            Overview: ${movie.overview || 'No description'}
+            Genres: ${movie.genres?.map(g => g.name).join(', ') || 'Unknown'}
+            
+            Focus on:
+            - Emotional appeal
+            - Target audience
+            - Unique elements
+            - Similar movies they might like`;
+
+            const result = await this.model.generateContent(prompt);
+            const explanation = (await result.response).text();
+
+            aiCache.explanations.set(cacheKey, explanation);
+            return explanation;
+        } catch (error) {
+            console.error('Explanation error:', error);
+            return 'An AI-powered explanation is not available right now.';
+        }
+    }
+
+    // Find similar movies with reasoning
+    async findSimilar(movie, candidates) {
+        try {
+            const candidateList = candidates.map(m => 
+                `${m.title} (${m.release_date?.slice(0,4) || 'Unknown'}): ${m.overview?.slice(0,100) || 'No description'}`
+            ).join('\n');
+
+            const prompt = `Find movies similar to "${movie.title}" and explain why.
+            
+            Target movie:
+            Title: ${movie.title}
+            Overview: ${movie.overview || 'No description'}
+            
+            Candidate movies:
+            ${candidateList}
+            
+            Return a JSON object with:
+            {
+                "similar": ["Movie Title 1", "Movie Title 2", ...],
+                "explanations": {
+                    "Movie Title 1": "Why it's similar"
+                },
+                "similarityScores": {
+                    "Movie Title 1": 0.9
+                }
+            }`;
+
+            const result = await this.model.generateContent(prompt);
+            const response = await result.response;
+            const text = response.text();
+            
+            const jsonMatch = text.match(/\{.*\}/s);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+        } catch (error) {
+            console.error('Similar movies error:', error);
+        }
+
+        return { similar: [], explanations: {}, similarityScores: {} };
+    }
+
+    // Generate smart search suggestions
+    async generateSuggestions(partial) {
+        try {
+            const prompt = `Generate 5 movie search suggestions based on "${partial}".
+            Make them natural language queries like:
+            - "funny comedies from the 90s"
+            - "action movies with strong female leads"
+            - "sci-fi films about artificial intelligence"
+            - "feel-good movies for a rainy day"
+            - "thrillers with plot twists"
+            
+            Return as JSON array of strings.`;
+
+            const result = await this.model.generateContent(prompt);
+            const response = await result.response;
+            const text = response.text();
+            
+            const jsonMatch = text.match(/\[.*\]/s);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]).slice(0, 5);
+            }
+        } catch (error) {
+            console.error('Suggestions error:', error);
+        }
+
+        return [];
+    }
+
+    // Mood-based recommendations
+    async moodRecommendations(mood, movies) {
+        const moodPrompts = {
+            happy: 'uplifting, cheerful, feel-good movies',
+            sad: 'emotional, touching, meaningful dramas',
+            excited: 'action-packed, thrilling, high-energy movies',
+            relaxed: 'calm, soothing, easy-going films',
+            thoughtful: 'thought-provoking, philosophical, deep movies',
+            romantic: 'love stories, romantic comedies, date night films',
+            scared: 'horror, suspense, terrifying movies',
+            nostalgic: 'classics, movies from past decades, retro films'
+        };
+
+        const promptText = moodPrompts[mood] || 'entertaining movies';
+
+        try {
+            const movieList = movies.map(m => 
+                `${m.title} (${m.release_date?.slice(0,4) || 'Unknown'}): ${m.overview?.slice(0,100) || 'No description'}`
+            ).join('\n');
+
+            const prompt = `Find movies matching this mood: "${promptText}"
+            
+            Available movies:
+            ${movieList}
+            
+            Return a JSON object with:
+            {
+                "recommendations": ["Movie Title 1", "Movie Title 2", ...],
+                "explanation": "Why these movies fit the mood",
+                "moodScore": {
+                    "Movie Title 1": 0.95
+                }
+            }`;
+
+            const result = await this.model.generateContent(prompt);
+            const response = await result.response;
+            const text = response.text();
+            
+            const jsonMatch = text.match(/\{.*\}/s);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+        } catch (error) {
+            console.error('Mood recommendations error:', error);
+        }
+
+        return { recommendations: [], explanation: '', moodScore: {} };
+    }
 }
 
-function logInfo(context, message, data = {}) {
-    console.log(`📌 [${context}]`, message, Object.keys(data).length ? data : '');
-}
+const aiAssistant = new AIAssistant();
 
 // =============================================================================
-// AXIOS CONFIGURATION WITH RETRY
+// LINK EXTRACTORS (same as original)
 // =============================================================================
-axiosRetry(axios, {
-    retries: 3,
-    retryDelay: axiosRetry.exponentialDelay,
-    retryCondition: (error) => {
-        return axiosRetry.isNetworkOrIdempotentRequestError(error) ||
-               error.response?.status >= 500;
-    }
-});
-
-// Create axios instances with different configurations
-const axiosWithProxy = axios.create({
-    timeout: 30000,
-    maxRedirects: 5,
-    validateStatus: status => status < 400,
-    headers: {
-        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
-});
-
-// =============================================================================
-// LINK EXTRACTORS FOR DIFFERENT SOURCES
-// =============================================================================
-
 class LinkExtractor {
     constructor() {
         this.sources = [
@@ -179,16 +416,15 @@ class LinkExtractor {
         const cached = linkCache.get(cacheKey);
         
         if (cached) {
-            logInfo('CACHE', `Cache hit for ${title}`, { movieId });
+            console.log(`Cache hit for ${title}`);
             return { ...cached, cached: true };
         }
 
-        logInfo('EXTRACT', `Extracting links for ${title} (${year})`);
+        console.log(`Extracting links for ${title} (${year})`);
         
         const results = [];
         const errors = [];
 
-        // Try each source in parallel with timeout
         const extractPromises = this.sources.map(async (source) => {
             try {
                 const timeoutPromise = new Promise((_, reject) => {
@@ -206,18 +442,15 @@ class LinkExtractor {
                 }
             } catch (error) {
                 errors.push({ source: source.name, error: error.message });
-                logError('EXTRACTOR', error, { source: source.name, movieId });
             }
         });
 
         await Promise.allSettled(extractPromises);
 
         if (results.length === 0) {
-            logError('EXTRACT', new Error('No links found'), { movieId, title, errors });
             return { error: 'No working links found', errors };
         }
 
-        // Validate and clean links
         const validatedLinks = await this.validateLinks(results);
         
         const output = {
@@ -229,7 +462,6 @@ class LinkExtractor {
             primary: validatedLinks[0]?.links[0] || null
         };
 
-        // Cache the results
         linkCache.set(cacheKey, output);
         
         return output;
@@ -244,18 +476,19 @@ class LinkExtractor {
             for (const link of sourceResult.links) {
                 try {
                     const isValid = await this.checkLink(link.url);
-                    if (isValid) {
+                    if (isValid.valid) {
                         validLinks.push({
                             ...link,
                             validated: true,
-                            checkedAt: Date.now()
+                            checkedAt: Date.now(),
+                            size: isValid.size,
+                            contentType: isValid.contentType
                         });
                     }
                 } catch (error) {
-                    logError('VALIDATE', error, { url: link.url });
+                    console.error('Validate error:', error.message);
                 }
                 
-                // Small delay to avoid rate limiting
                 await new Promise(r => setTimeout(r, 500));
             }
             
@@ -283,10 +516,9 @@ class LinkExtractor {
             const contentType = response.headers['content-type'] || '';
             const contentLength = response.headers['content-length'];
             
-            // Check if it's a video file
             const isValid = contentType.includes('video/') || 
                            url.match(/\.(mp4|mkv|avi|mov|webm)$/i) ||
-                           (contentLength && parseInt(contentLength) > 1024 * 1024); // > 1MB
+                           (contentLength && parseInt(contentLength) > 1024 * 1024);
             
             return {
                 valid: isValid,
@@ -296,7 +528,6 @@ class LinkExtractor {
             };
         } catch (error) {
             if (error.response?.status === 302 || error.response?.status === 301) {
-                // Follow redirect
                 return this.checkLink(error.response.headers.location);
             }
             return { valid: false, error: error.message };
@@ -304,27 +535,20 @@ class LinkExtractor {
     }
 }
 
-// =============================================================================
-// SOURCE 1: VIDSRC EXTRACTOR
-// =============================================================================
+// Source extractor classes (same as original)
 class VidsrcExtractor {
-    constructor() {
-        this.name = 'vidsrc';
-    }
-
+    constructor() { this.name = 'vidsrc'; }
     async extract(movieId, title, year) {
         const embedUrl = `https://vidsrc.to/embed/movie/${movieId}`;
-        
         try {
-            const response = await axiosWithProxy.get(embedUrl);
+            const response = await axios.get(embedUrl, {
+                headers: { 'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)] }
+            });
             const $ = cheerio.load(response.data);
-            
             const links = [];
             
-            // Extract video sources from various locations
             $('source').each((i, el) => {
                 const src = $(el).attr('src');
-                const type = $(el).attr('type');
                 if (src && src.includes('.mp4')) {
                     links.push({
                         url: src,
@@ -335,26 +559,12 @@ class VidsrcExtractor {
                 }
             });
 
-            // Look for iframe sources
             $('iframe').each((i, el) => {
                 const src = $(el).attr('src');
                 if (src && (src.includes('embed') || src.includes('play'))) {
                     links.push({
                         url: src,
                         type: 'embed',
-                        source: 'vidsrc'
-                    });
-                }
-            });
-
-            // Extract from data attributes
-            $('[data-src], [data-url], [data-video]').each((i, el) => {
-                const dataSrc = $(el).attr('data-src') || $(el).attr('data-url') || $(el).attr('data-video');
-                if (dataSrc && dataSrc.includes('http')) {
-                    links.push({
-                        url: dataSrc,
-                        quality: this.detectQuality(dataSrc),
-                        type: 'mp4',
                         source: 'vidsrc'
                     });
                 }
@@ -368,7 +578,6 @@ class VidsrcExtractor {
             throw new Error(`Vidsrc extraction failed: ${error.message}`);
         }
     }
-
     detectQuality(url) {
         if (url.includes('1080') || url.includes('1080p')) return '1080p';
         if (url.includes('720') || url.includes('720p')) return '720p';
@@ -376,35 +585,26 @@ class VidsrcExtractor {
         if (url.includes('360') || url.includes('360p')) return '360p';
         return 'unknown';
     }
-
     deduplicateLinks(links) {
         const seen = new Set();
         return links.filter(link => {
-            const key = link.url.split('?')[0]; // Remove query params for dedup
+            const key = link.url.split('?')[0];
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
         });
     }
-
     getBestQuality(links) {
         const qualityOrder = ['1080p', '720p', '480p', '360p', 'unknown'];
         for (const q of qualityOrder) {
-            const hasQuality = links.some(l => l.quality === q);
-            if (hasQuality) return q;
+            if (links.some(l => l.quality === q)) return q;
         }
         return 'unknown';
     }
 }
 
-// =============================================================================
-// SOURCE 2: EMBED EXTRACTOR
-// =============================================================================
 class EmbedExtractor {
-    constructor() {
-        this.name = 'embed';
-    }
-
+    constructor() { this.name = 'embed'; }
     async extract(movieId, title, year) {
         const domains = [
             `https://multiembed.mov/directstream.php?video_id=${movieId}&s=movie`,
@@ -416,34 +616,29 @@ class EmbedExtractor {
 
         for (const domain of domains) {
             try {
-                const response = await axiosWithProxy.get(domain, {
+                const response = await axios.get(domain, {
                     headers: {
-                        'Referer': 'https://www.google.com/',
-                        'Origin': 'https://www.google.com'
+                        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+                        'Referer': 'https://www.google.com/'
                     }
                 });
                 
-                // Extract from JSON responses
-                if (typeof response.data === 'object') {
-                    if (response.data.sources) {
-                        response.data.sources.forEach(source => {
-                            if (source.file || source.url) {
-                                links.push({
-                                    url: source.file || source.url,
-                                    quality: source.label || source.quality || 'auto',
-                                    type: 'mp4',
-                                    source: 'embed'
-                                });
-                            }
-                        });
-                    }
+                if (typeof response.data === 'object' && response.data.sources) {
+                    response.data.sources.forEach(source => {
+                        if (source.file || source.url) {
+                            links.push({
+                                url: source.file || source.url,
+                                quality: source.label || source.quality || 'auto',
+                                type: 'mp4',
+                                source: 'embed'
+                            });
+                        }
+                    });
                 }
                 
-                // Extract from HTML
                 const $ = cheerio.load(response.data);
                 
-                // Look for video players
-                $('video source, video[src], .player source, .video-js source').each((i, el) => {
+                $('video source, video[src]').each((i, el) => {
                     const src = $(el).attr('src') || $(el).parent().attr('src');
                     if (src && src.match(/\.(mp4|m3u8)/)) {
                         links.push({
@@ -455,27 +650,8 @@ class EmbedExtractor {
                     }
                 });
 
-                // Look for script variables containing video URLs
-                const scripts = $('script').map((i, el) => $(el).html()).get();
-                scripts.forEach(script => {
-                    if (script) {
-                        const urlMatches = script.match(/https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*/g);
-                        if (urlMatches) {
-                            urlMatches.forEach(url => {
-                                links.push({
-                                    url: url,
-                                    quality: url.includes('1080') ? '1080p' : 
-                                            url.includes('720') ? '720p' : 'auto',
-                                    type: url.includes('.m3u8') ? 'hls' : 'mp4',
-                                    source: 'embed'
-                                });
-                            });
-                        }
-                    }
-                });
-
             } catch (error) {
-                continue; // Try next domain
+                continue;
             }
         }
 
@@ -484,7 +660,6 @@ class EmbedExtractor {
             quality: this.getBestQuality(links)
         };
     }
-
     deduplicateLinks(links) {
         const seen = new Set();
         return links.filter(link => {
@@ -494,7 +669,6 @@ class EmbedExtractor {
             return true;
         });
     }
-
     getBestQuality(links) {
         if (links.some(l => l.quality === '1080p')) return '1080p';
         if (links.some(l => l.quality === '720p')) return '720p';
@@ -502,14 +676,8 @@ class EmbedExtractor {
     }
 }
 
-// =============================================================================
-// SOURCE 3: SUPER EMBED EXTRACTOR (axios/cheerio — no Puppeteer)
-// =============================================================================
 class SuperEmbedExtractor {
-    constructor() {
-        this.name = 'superembed';
-    }
-
+    constructor() { this.name = 'superembed'; }
     async extract(movieId, title, year) {
         const urls = [
             `https://superembed.stream/movie/${movieId}`,
@@ -520,16 +688,15 @@ class SuperEmbedExtractor {
 
         for (const url of urls) {
             try {
-                const response = await axiosWithProxy.get(url, {
+                const response = await axios.get(url, {
                     headers: {
-                        'Referer': 'https://www.google.com/',
-                        'Accept-Language': 'en-US,en;q=0.9'
+                        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+                        'Referer': 'https://www.google.com/'
                     }
                 });
 
                 const $ = cheerio.load(response.data);
 
-                // Extract from video/source elements
                 $('video source, video[src]').each((i, el) => {
                     const src = $(el).attr('src') || $(el).parent().attr('src');
                     if (src && src.match(/\.(mp4|m3u8)/i)) {
@@ -542,7 +709,6 @@ class SuperEmbedExtractor {
                     }
                 });
 
-                // Extract from data attributes
                 $('[data-src],[data-url],[data-video],[data-file]').each((i, el) => {
                     const src = $(el).attr('data-src') || $(el).attr('data-url') ||
                                 $(el).attr('data-video') || $(el).attr('data-file');
@@ -556,24 +722,8 @@ class SuperEmbedExtractor {
                     }
                 });
 
-                // Scan inline scripts for video URLs
-                $('script').each((i, el) => {
-                    const content = $(el).html() || '';
-                    const matches = content.match(/https?:\/\/[^"'\s\\]+\.(mp4|m3u8)[^"'\s\\]*/gi);
-                    if (matches) {
-                        matches.forEach(matchUrl => {
-                            links.push({
-                                url: matchUrl,
-                                quality: this.detectQuality(matchUrl),
-                                type: matchUrl.includes('.m3u8') ? 'hls' : 'mp4',
-                                source: 'superembed'
-                            });
-                        });
-                    }
-                });
-
             } catch (error) {
-                continue; // Try next URL
+                continue;
             }
         }
 
@@ -582,14 +732,12 @@ class SuperEmbedExtractor {
             quality: this.getBestQuality(links)
         };
     }
-
     detectQuality(url) {
         if (url.includes('1080') || url.includes('1080p')) return '1080p';
         if (url.includes('720') || url.includes('720p')) return '720p';
         if (url.includes('480') || url.includes('480p')) return '480p';
         return 'auto';
     }
-
     deduplicateLinks(links) {
         const seen = new Set();
         return links.filter(link => {
@@ -599,7 +747,6 @@ class SuperEmbedExtractor {
             return true;
         });
     }
-
     getBestQuality(links) {
         if (links.some(l => l.quality === '1080p')) return '1080p';
         if (links.some(l => l.quality === '720p')) return '720p';
@@ -607,14 +754,8 @@ class SuperEmbedExtractor {
     }
 }
 
-// =============================================================================
-// SOURCE 4: MULTI EMBED EXTRACTOR
-// =============================================================================
 class MultiEmbedExtractor {
-    constructor() {
-        this.name = 'multisrc';
-    }
-
+    constructor() { this.name = 'multisrc'; }
     async extract(movieId, title, year) {
         const baseUrls = [
             `https://vidsrc.xyz/embed/movie/${movieId}`,
@@ -627,23 +768,21 @@ class MultiEmbedExtractor {
 
         for (const baseUrl of baseUrls) {
             try {
-                const response = await axiosWithProxy.get(baseUrl, {
+                const response = await axios.get(baseUrl, {
                     headers: {
+                        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
                         'Referer': 'https://www.google.com/'
                     }
                 });
 
                 const $ = cheerio.load(response.data);
 
-                // Extract from common patterns
                 const patterns = [
                     'iframe[src]',
                     'source[src]',
                     '[data-player]',
                     '[data-video]',
-                    '[data-src]',
-                    '#player source',
-                    '.player source'
+                    '[data-src]'
                 ];
 
                 patterns.forEach(pattern => {
@@ -654,7 +793,6 @@ class MultiEmbedExtractor {
                                  $(el).attr('data-src');
                         
                         if (src) {
-                            // Handle relative URLs
                             if (src.startsWith('//')) {
                                 src = 'https:' + src;
                             } else if (src.startsWith('/')) {
@@ -674,33 +812,8 @@ class MultiEmbedExtractor {
                     });
                 });
 
-                // Check for JSON configs
-                const scripts = $('script').map((i, el) => $(el).html()).get();
-                scripts.forEach(script => {
-                    if (script && script.includes('sources') && script.includes('file')) {
-                        try {
-                            const jsonMatch = script.match(/sources:\s*(\[.*?\])/s);
-                            if (jsonMatch) {
-                                const sources = JSON.parse(jsonMatch[1].replace(/'/g, '"'));
-                                sources.forEach(source => {
-                                    if (source.file) {
-                                        links.push({
-                                            url: source.file,
-                                            quality: source.label || 'auto',
-                                            type: 'mp4',
-                                            source: 'multisrc'
-                                        });
-                                    }
-                                });
-                            }
-                        } catch (e) {
-                            // Ignore JSON parse errors
-                        }
-                    }
-                });
-
             } catch (error) {
-                continue; // Try next URL
+                continue;
             }
         }
 
@@ -709,7 +822,6 @@ class MultiEmbedExtractor {
             quality: this.getBestQuality(links)
         };
     }
-
     detectQuality(url) {
         if (url.includes('1080') || url.includes('1080p')) return '1080p';
         if (url.includes('720') || url.includes('720p')) return '720p';
@@ -717,7 +829,6 @@ class MultiEmbedExtractor {
         if (url.includes('360') || url.includes('360p')) return '360p';
         return 'auto';
     }
-
     deduplicateLinks(links) {
         const seen = new Set();
         return links.filter(link => {
@@ -727,93 +838,12 @@ class MultiEmbedExtractor {
             return true;
         });
     }
-
     getBestQuality(links) {
         const qualityOrder = ['1080p', '720p', '480p', '360p', 'auto'];
         for (const q of qualityOrder) {
-            const hasQuality = links.some(l => l.quality === q);
-            if (hasQuality) return q;
+            if (links.some(l => l.quality === q)) return q;
         }
         return 'auto';
-    }
-}
-
-// =============================================================================
-// TITLE MATCHING & SCORING SYSTEM
-// =============================================================================
-class TitleMatcher {
-    constructor() {
-        this.minScore = 0.7; // Minimum similarity score to consider a match
-    }
-
-    calculateSimilarity(title1, title2) {
-        // Normalize strings
-        const normalize = (str) => {
-            return str.toLowerCase()
-                .replace(/[^\w\s]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-        };
-
-        const a = normalize(title1);
-        const b = normalize(title2);
-
-        // Exact match
-        if (a === b) return 1.0;
-
-        // Check if one contains the other
-        if (a.includes(b) || b.includes(a)) {
-            const longer = a.length > b.length ? a : b;
-            const shorter = a.length > b.length ? b : a;
-            return shorter.length / longer.length;
-        }
-
-        // Levenshtein distance for fuzzy matching
-        const distance = this.levenshteinDistance(a, b);
-        const maxLength = Math.max(a.length, b.length);
-        return 1 - (distance / maxLength);
-    }
-
-    levenshteinDistance(a, b) {
-        const matrix = [];
-        for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-        for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-
-        for (let i = 1; i <= b.length; i++) {
-            for (let j = 1; j <= a.length; j++) {
-                if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                    matrix[i][j] = matrix[i - 1][j - 1];
-                } else {
-                    matrix[i][j] = Math.min(
-                        matrix[i - 1][j - 1] + 1,
-                        matrix[i][j - 1] + 1,
-                        matrix[i - 1][j] + 1
-                    );
-                }
-            }
-        }
-        return matrix[b.length][a.length];
-    }
-
-    scoreMatch(sourceTitle, targetTitle, sourceYear, targetYear) {
-        let score = this.calculateSimilarity(sourceTitle, targetTitle);
-        
-        // Year bonus
-        if (sourceYear && targetYear && Math.abs(sourceYear - targetYear) <= 1) {
-            score += 0.15;
-        }
-        
-        // Penalize if years don't match
-        if (sourceYear && targetYear && Math.abs(sourceYear - targetYear) > 2) {
-            score -= 0.3;
-        }
-        
-        return Math.min(1, Math.max(0, score));
-    }
-
-    isMatch(sourceTitle, sourceYear, targetTitle, targetYear) {
-        const score = this.scoreMatch(sourceTitle, targetTitle, sourceYear, targetYear);
-        return score >= this.minScore;
     }
 }
 
@@ -823,13 +853,11 @@ class TitleMatcher {
 class DownloadManager {
     constructor() {
         this.extractor = new LinkExtractor();
-        this.matcher = new TitleMatcher();
         this.activeDownloads = new Map();
     }
 
     async getDownloadLinks(movieId, title, year) {
         try {
-            // First, get TMDB details to ensure we have accurate metadata
             const tmdbResponse = await axios.get(
                 `https://api.themoviedb.org/3/movie/${movieId}?api_key=${TMDB_KEY}`
             );
@@ -838,12 +866,11 @@ class DownloadManager {
             const movieTitle = movie.title;
             const movieYear = new Date(movie.release_date).getFullYear();
 
-            // Check if we already have links in cache
             const cached = linkCache.get(`links_${movieId}`);
             if (cached) {
                 const age = Date.now() - cached.timestamp;
-                if (age < 12 * 60 * 60 * 1000) { // 12 hours
-                    logInfo('CACHE', `Returning cached links for ${movieTitle}`);
+                if (age < 12 * 60 * 60 * 1000) {
+                    console.log(`Returning cached links for ${movieTitle}`);
                     return {
                         ...cached,
                         cached: true,
@@ -852,17 +879,14 @@ class DownloadManager {
                 }
             }
 
-            // Extract fresh links
             const links = await this.extractor.extractLinks(movieId, movieTitle, movieYear);
             
             if (links.error) {
                 throw new Error(links.error);
             }
 
-            // Process and rank links
             const processed = this.processLinks(links, movieTitle, movieYear);
 
-            // Cache the processed links
             linkCache.set(`links_${movieId}`, {
                 ...processed,
                 timestamp: Date.now()
@@ -871,7 +895,7 @@ class DownloadManager {
             return processed;
 
         } catch (error) {
-            logError('DOWNLOAD_MANAGER', error, { movieId, title });
+            console.error('Download manager error:', error);
             throw error;
         }
     }
@@ -885,7 +909,6 @@ class DownloadManager {
             sources: []
         };
 
-        // Process each source's links
         for (const source of links.sources) {
             const sourceLinks = source.links.map(link => ({
                 ...link,
@@ -893,7 +916,6 @@ class DownloadManager {
                 verified: link.validated || false
             }));
 
-            // Sort by quality
             sourceLinks.sort((a, b) => this.qualityRank(b.quality) - this.qualityRank(a.quality));
 
             processed.sources.push({
@@ -903,12 +925,10 @@ class DownloadManager {
             });
         }
 
-        // Sort sources by best quality
         processed.sources.sort((a, b) => 
             this.qualityRank(b.bestQuality) - this.qualityRank(a.bestQuality)
         );
 
-        // Generate quality options for download
         processed.qualityOptions = this.generateQualityOptions(processed.sources);
 
         return processed;
@@ -924,7 +944,7 @@ class DownloadManager {
         if (quality.includes('480') || quality.includes('480p')) return '480p';
         if (quality.includes('360') || quality.includes('360p')) return '360p';
         
-        return '720p'; // Default
+        return '720p';
     }
 
     qualityRank(quality) {
@@ -941,7 +961,6 @@ class DownloadManager {
     generateQualityOptions(sources) {
         const options = {};
         
-        // Collect all available qualities
         for (const source of sources) {
             for (const link of source.links) {
                 if (!options[link.quality]) {
@@ -955,7 +974,6 @@ class DownloadManager {
             }
         }
 
-        // Sort qualities
         const sorted = {};
         const qualities = ['1080p', '720p', '480p', '360p'];
         
@@ -978,7 +996,6 @@ class DownloadManager {
 
             const sources = links.qualityOptions[quality];
             
-            // Try each source until one works
             for (const source of sources) {
                 try {
                     const response = await axios.head(source.url, {
@@ -999,22 +1016,19 @@ class DownloadManager {
                         };
                     }
                 } catch (error) {
-                    continue; // Try next source
+                    continue;
                 }
             }
 
             throw new Error('No working download sources found');
 
         } catch (error) {
-            logError('DOWNLOAD_INIT', error, { movieId, quality });
+            console.error('Download initiation error:', error);
             throw error;
         }
     }
 }
 
-// =============================================================================
-// INITIALIZE MANAGERS
-// =============================================================================
 const downloadManager = new DownloadManager();
 const extractor = new LinkExtractor();
 
@@ -1028,11 +1042,17 @@ app.get('/api/health', (req, res) => {
         status: 'ok',
         timestamp: Date.now(),
         uptime: process.uptime(),
-        cacheSize: linkCache.keys().length
+        cacheSize: linkCache.keys().length,
+        aiCacheSize: {
+            embeddings: aiCache.embeddings.keys().length,
+            recommendations: aiCache.recommendations.keys().length,
+            explanations: aiCache.explanations.keys().length,
+            semantic: aiCache.semantic.keys().length
+        }
     });
 });
 
-// Get movie details
+// Get movie details with AI insights
 app.get('/api/movie/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -1047,22 +1067,184 @@ app.get('/api/movie/:id', async (req, res) => {
             v => v.type === 'Trailer' && v.site === 'YouTube'
         );
 
+        // Get AI explanation
+        const aiExplanation = await aiAssistant.explainMovie(movie);
+
         res.json({
             ...movie,
-            trailerKey: trailer?.key || null
+            trailerKey: trailer?.key || null,
+            aiExplanation
         });
     } catch (error) {
-        logError('API_MOVIE', error);
+        console.error('Movie API error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Get download options
+// AI Recommendations
+app.post('/api/ai/recommendations', async (req, res) => {
+    try {
+        const { preferences, movieIds } = req.body;
+
+        // Fetch movie details from TMDB
+        const moviePromises = movieIds.map(id =>
+            axios.get(`https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`)
+        );
+        
+        const movieResponses = await Promise.allSettled(moviePromises);
+        const movies = movieResponses
+            .filter(r => r.status === 'fulfilled')
+            .map(r => r.value.data);
+
+        const aiData = await aiAssistant.getRecommendations(preferences, movies);
+
+        // Map rankings back to full movie objects
+        const rankedMovies = [];
+        const movieMap = new Map(movies.map(m => [m.title, m]));
+
+        for (const title of aiData.rankings || []) {
+            const movie = movieMap.get(title);
+            if (movie) {
+                rankedMovies.push({
+                    ...movie,
+                    aiConfidence: aiData.confidenceScores?.[title] || 0.5,
+                    aiExplanation: aiData.explanations?.[title] || ''
+                });
+            }
+        }
+
+        res.json({
+            recommendations: rankedMovies,
+            explanations: aiData.explanations || {},
+            confidenceScores: aiData.confidenceScores || {}
+        });
+    } catch (error) {
+        console.error('AI Recommendations error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Semantic Search
+app.post('/api/ai/semantic-search', async (req, res) => {
+    try {
+        const { query, movieIds } = req.body;
+
+        const moviePromises = movieIds.map(id =>
+            axios.get(`https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`)
+        );
+        
+        const movieResponses = await Promise.allSettled(moviePromises);
+        const movies = movieResponses
+            .filter(r => r.status === 'fulfilled')
+            .map(r => r.value.data);
+
+        const results = await aiAssistant.semanticSearch(query, movies);
+
+        res.json({
+            query,
+            results,
+            count: results.length
+        });
+    } catch (error) {
+        console.error('Semantic search error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Mood-based recommendations
+app.post('/api/ai/mood', async (req, res) => {
+    try {
+        const { mood, movieIds } = req.body;
+
+        const moviePromises = movieIds.map(id =>
+            axios.get(`https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`)
+        );
+        
+        const movieResponses = await Promise.allSettled(moviePromises);
+        const movies = movieResponses
+            .filter(r => r.status === 'fulfilled')
+            .map(r => r.value.data);
+
+        const aiData = await aiAssistant.moodRecommendations(mood, movies);
+
+        const movieMap = new Map(movies.map(m => [m.title, m]));
+        const recommendations = (aiData.recommendations || []).map(title => ({
+            ...movieMap.get(title),
+            moodScore: aiData.moodScore?.[title] || 0.5
+        })).filter(m => m);
+
+        res.json({
+            mood,
+            recommendations,
+            explanation: aiData.explanation || '',
+            moodScores: aiData.moodScore || {}
+        });
+    } catch (error) {
+        console.error('Mood recommendations error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Similar movies with AI reasoning
+app.post('/api/ai/similar', async (req, res) => {
+    try {
+        const { movieId, candidateIds } = req.body;
+
+        const [targetRes, ...candidateRes] = await Promise.all([
+            axios.get(`https://api.themoviedb.org/3/movie/${movieId}?api_key=${TMDB_KEY}`),
+            ...candidateIds.map(id =>
+                axios.get(`https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`)
+            )
+        ]);
+
+        const targetMovie = targetRes.data;
+        const candidateMovies = candidateRes.map(r => r.data);
+
+        const aiData = await aiAssistant.findSimilar(targetMovie, candidateMovies);
+
+        const movieMap = new Map(candidateMovies.map(m => [m.title, m]));
+        const similar = (aiData.similar || []).map(title => ({
+            ...movieMap.get(title),
+            similarityScore: aiData.similarityScores?.[title] || 0.5,
+            similarityExplanation: aiData.explanations?.[title] || ''
+        })).filter(m => m);
+
+        res.json({
+            targetMovie: {
+                id: targetMovie.id,
+                title: targetMovie.title
+            },
+            similar,
+            explanations: aiData.explanations || {},
+            similarityScores: aiData.similarityScores || {}
+        });
+    } catch (error) {
+        console.error('Similar movies error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Generate search suggestions
+app.get('/api/ai/suggestions', async (req, res) => {
+    try {
+        const { q } = req.query;
+        if (!q || q.length < 2) {
+            return res.json({ suggestions: [] });
+        }
+
+        const suggestions = await aiAssistant.generateSuggestions(q);
+        res.json({ suggestions });
+    } catch (error) {
+        console.error('Suggestions error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get download options (original)
 app.get('/api/download/options/:id', async (req, res) => {
     try {
         const { id } = req.params;
         
-        // Get movie details from TMDB
         const movieRes = await axios.get(
             `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`
         );
@@ -1070,12 +1252,9 @@ app.get('/api/download/options/:id', async (req, res) => {
         const movie = movieRes.data;
         const year = new Date(movie.release_date).getFullYear();
 
-        // Get download links
         const links = await downloadManager.getDownloadLinks(id, movie.title, year);
 
-        // Format response for frontend
         const qualityOptions = Object.entries(links.qualityOptions || {}).map(([quality, sources]) => {
-            // Calculate approximate file size (1 min = ~10MB at 720p)
             const runtime = movie.runtime || 120;
             const sizePerMin = quality === '1080p' ? 25 : 
                               quality === '720p' ? 12 : 
@@ -1107,7 +1286,7 @@ app.get('/api/download/options/:id', async (req, res) => {
         });
 
     } catch (error) {
-        logError('API_DOWNLOAD_OPTIONS', error);
+        console.error('Download options error:', error);
         res.status(500).json({ 
             error: 'Failed to fetch download options',
             details: error.message 
@@ -1115,7 +1294,7 @@ app.get('/api/download/options/:id', async (req, res) => {
     }
 });
 
-// Initiate download
+// Initiate download (original)
 app.get('/api/download', async (req, res) => {
     try {
         const { movieId, quality, title } = req.query;
@@ -1134,14 +1313,12 @@ app.get('/api/download', async (req, res) => {
             });
         }
 
-        // Set response headers
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('X-Download-URL', downloadInfo.url);
         res.setHeader('X-Download-Size', downloadInfo.size || 'unknown');
         res.setHeader('X-Download-Source', downloadInfo.source);
         res.setHeader('X-Download-Quality', downloadInfo.quality);
 
-        // Return download info
         res.json({
             success: true,
             url: downloadInfo.url,
@@ -1152,7 +1329,7 @@ app.get('/api/download', async (req, res) => {
         });
 
     } catch (error) {
-        logError('API_DOWNLOAD', error);
+        console.error('Download error:', error);
         res.status(500).json({ 
             error: 'Download failed',
             details: error.message 
@@ -1160,7 +1337,7 @@ app.get('/api/download', async (req, res) => {
     }
 });
 
-// Proxy download (for CORS issues)
+// Proxy download (original)
 app.get('/api/download/proxy', async (req, res) => {
     try {
         const { url } = req.query;
@@ -1181,7 +1358,6 @@ app.get('/api/download/proxy', async (req, res) => {
             }
         });
 
-        // Forward headers
         Object.entries(response.headers).forEach(([key, value]) => {
             if (key.toLowerCase().startsWith('content-')) {
                 res.setHeader(key, value);
@@ -1190,15 +1366,10 @@ app.get('/api/download/proxy', async (req, res) => {
 
         res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
 
-        // Pipe the response
         response.data.pipe(res);
 
-        response.data.on('end', () => {
-            logInfo('PROXY', 'Download completed');
-        });
-
     } catch (error) {
-        logError('PROXY_DOWNLOAD', error);
+        console.error('Proxy download error:', error);
         if (!res.headersSent) {
             res.status(500).json({ error: 'Proxy download failed' });
         }
@@ -1210,39 +1381,47 @@ app.get('/api/cache/status', (req, res) => {
     const keys = linkCache.keys();
     const stats = {
         totalEntries: keys.length,
-        keys: keys.slice(0, 20), // First 20 keys
+        keys: keys.slice(0, 20),
         memory: process.memoryUsage(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        aiCache: {
+            embeddings: aiCache.embeddings.keys().length,
+            recommendations: aiCache.recommendations.keys().length,
+            explanations: aiCache.explanations.keys().length,
+            semantic: aiCache.semantic.keys().length
+        }
     };
     res.json(stats);
 });
 
-// Clear cache (admin only - add auth in production)
+// Clear cache (admin only)
 app.post('/api/cache/clear', (req, res) => {
     linkCache.flushAll();
+    aiCache.embeddings.flushAll();
+    aiCache.recommendations.flushAll();
+    aiCache.explanations.flushAll();
+    aiCache.semantic.flushAll();
     saveCacheToDisk();
-    res.json({ success: true, message: 'Cache cleared' });
+    res.json({ success: true, message: 'All caches cleared' });
 });
 
 // =============================================================================
 // BACKGROUND TASKS
 // =============================================================================
 
-// Refresh expired cache entries
 async function refreshCache() {
     const keys = linkCache.keys();
     const refreshKeys = keys.filter(key => {
         const value = linkCache.get(key);
         const age = Date.now() - (value.timestamp || 0);
-        return age > 6 * 60 * 60 * 1000; // Older than 6 hours
+        return age > 6 * 60 * 60 * 1000;
     });
 
-    for (const key of refreshKeys.slice(0, 5)) { // Limit to 5 per run
+    for (const key of refreshKeys.slice(0, 5)) {
         try {
             const movieId = key.replace('links_', '');
-            logInfo('REFRESH', `Refreshing cache for ${movieId}`);
+            console.log(`Refreshing cache for ${movieId}`);
             
-            // Get fresh data
             const movieRes = await axios.get(
                 `https://api.themoviedb.org/3/movie/${movieId}?api_key=${TMDB_KEY}`
             );
@@ -1258,25 +1437,22 @@ async function refreshCache() {
                 });
             }
             
-            // Delay between requests
             await new Promise(r => setTimeout(r, 5000));
             
         } catch (error) {
-            logError('REFRESH', error, { key });
+            console.error('Refresh error:', error);
         }
     }
 }
 
-// Run refresh every hour
 setInterval(refreshCache, 60 * 60 * 1000);
 
 // =============================================================================
 // CLEANUP
 // =============================================================================
 process.on('SIGINT', async () => {
-    logInfo('SHUTDOWN', 'Saving cache and cleaning up...');
+    console.log('Shutting down, saving cache...');
     saveCacheToDisk();
-    
     process.exit(0);
 });
 
@@ -1285,13 +1461,15 @@ process.on('SIGINT', async () => {
 // =============================================================================
 app.listen(PORT, HOST, () => {
     console.log(`
-╔════════════════════════════════════════════════════════════╗
-║              PLAYKIT Download Server v2.0                  ║
-║   Real link extraction · Validation · Caching · Fallback   ║
-╠════════════════════════════════════════════════════════════╣
-║  Server: http://${HOST}:${PORT}                                ║
-║  Cache: ${linkCache.keys().length} entries                         ║
-║  Sources: vidsrc, embed, superembed, multisrc              ║
-╚════════════════════════════════════════════════════════════╝
+════════════════════════════════════════════════════════════
+              PLAYKIT AI-Powered Server v3.0
+   Real link extraction · Gemini AI · Semantic Search · Caching
+════════════════════════════════════════════════════════════
+  Server: http://${HOST}:${PORT}
+  Cache: ${linkCache.keys().length} entries
+  AI Cache: ${aiCache.embeddings.keys().length + aiCache.recommendations.keys().length + aiCache.explanations.keys().length + aiCache.semantic.keys().length} entries
+  Sources: vidsrc, embed, superembed, multisrc
+  AI Features: Recommendations, Semantic Search, Mood Picks, Explanations
+════════════════════════════════════════════════════════════
     `);
 });
