@@ -23,7 +23,7 @@ const HOST = '0.0.0.0';
 // ADVANCED CORS & SECURITY
 // =============================================================================
 app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', 'https://streamnt.netlify.app');
+    res.setHeader('Access-Control-Allow-Origin', 'https://streamnt.netlify.app', 'http://127.0.0.1:5500/');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-Exact-Size, X-Movie-Title, X-Cache-Hit');
