@@ -50,9 +50,11 @@ app.use('/api/', limiter);
 // =============================================================================
 const TMDB_KEY = '480f73d92f9395eb2140f092c746b3bc';
 const YT_KEY   = 'AIzaSyB3YRLnHIsJyzcktFLBROO-UkfW5wKwD-Q';
+const SPORTMONKS_KEY = 'YQAAr7Ll4L4hxOSnhyvnPxILwNkDKbDVrGOVDfaCU9N2HvTQBe7tWROf31f7';
 
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 const YT_BASE   = 'https://www.googleapis.com/youtube/v3';
+const SPORTMONKS_BASE = 'https://api.sportmonks.com/v3/football';
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -76,6 +78,14 @@ const LOG_DIR = path.join(__dirname, 'logs');
 const linkCache = new NodeCache({
     stdTTL: 86400, // 24 hours default TTL
     checkperiod: 3600,
+    useClones: false
+});
+
+// Short-lived cache for sports data — livescores update fast but we don't want
+// every open tab hammering SportMonks' rate limit on every poll
+const sportsCache = new NodeCache({
+    stdTTL: 20,       // 20s default (fine for livescores; fixtures/standings just get refetched a bit more often than needed)
+    checkperiod: 30,
     useClones: false
 });
 
@@ -984,6 +994,35 @@ app.get('/api/youtube/*', async (req, res) => {
     } catch (error) {
         logError('YT_PROXY', error);
         res.status(error.response?.status || 500).json({ error: error.message });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// SPORTMONKS PROXY — injects api_token server-side, forwards any path + query params
+// Frontend calls: GET /api/sports/<path>?<params>
+// Short-cached (see sportsCache) so a room full of tabs polling livescores
+// doesn't multiply into that many hits against the SportMonks rate limit.
+// -----------------------------------------------------------------------------
+app.get('/api/sports/*', async (req, res) => {
+    try {
+        const sportsPath = req.params[0];                             // e.g. "livescores/inplay"
+        const query      = { ...req.query, api_token: SPORTMONKS_KEY };
+        const qs         = new URLSearchParams(query).toString();
+        const url         = `${SPORTMONKS_BASE}/${sportsPath}?${qs}`;
+        const cacheKey    = url;
+
+        const cached = sportsCache.get(cacheKey);
+        if (cached) {
+            res.setHeader('X-Cache-Hit', 'true');
+            return res.json(cached);
+        }
+
+        const response = await axios.get(url, { timeout: 10000 });
+        sportsCache.set(cacheKey, response.data);
+        res.json(response.data);
+    } catch (error) {
+        logError('SPORTMONKS_PROXY', error);
+        res.status(error.response?.status || 500).json(error.response?.data || { error: error.message });
     }
 });
 
