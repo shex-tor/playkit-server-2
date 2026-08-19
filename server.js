@@ -1,5 +1,5 @@
 // =============================================================================
-// server.js — PLAYKIT Movie Download Server
+// server.js — STREAMNET Movie Download Server
 // Complete system with real link extraction, validation, and caching
 // =============================================================================
 
@@ -14,6 +14,11 @@ const NodeCache = require('node-cache');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const os = require('os');
+const { exec } = require('child_process');
+const util = require('util');
+const ytdl = require('ytdl-core');
+
+const execPromise = util.promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,11 +55,9 @@ app.use('/api/', limiter);
 // =============================================================================
 const TMDB_KEY = '480f73d92f9395eb2140f092c746b3bc';
 const YT_KEY   = 'AIzaSyB3YRLnHIsJyzcktFLBROO-UkfW5wKwD-Q';
-const SPORTMONKS_KEY = 'YQAAr7Ll4L4hxOSnhyvnPxILwNkDKbDVrGOVDfaCU9N2HvTQBe7tWROf31f7';
 
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 const YT_BASE   = 'https://www.googleapis.com/youtube/v3';
-const SPORTMONKS_BASE = 'https://api.sportmonks.com/v3/football';
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -78,14 +81,6 @@ const LOG_DIR = path.join(__dirname, 'logs');
 const linkCache = new NodeCache({
     stdTTL: 86400, // 24 hours default TTL
     checkperiod: 3600,
-    useClones: false
-});
-
-// Short-lived cache for sports data — livescores update fast but we don't want
-// every open tab hammering SportMonks' rate limit on every poll
-const sportsCache = new NodeCache({
-    stdTTL: 20,       // 20s default (fine for livescores; fixtures/standings just get refetched a bit more often than needed)
-    checkperiod: 30,
     useClones: false
 });
 
@@ -174,6 +169,76 @@ const axiosWithProxy = axios.create({
         'Upgrade-Insecure-Requests': '1'
     }
 });
+
+// =============================================================================
+// YOUTUBE DOWNLOADER
+// =============================================================================
+async function downloadYouTubeVideo(videoId, quality = 'highest') {
+    try {
+        // First, try using ytdl-core (pure Node.js, no external dependencies)
+        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        
+        // Check if video is available
+        const info = await ytdl.getInfo(videoUrl);
+        
+        // Get the best available format
+        let format = ytdl.chooseFormat(info.formats, { quality: 'highestvideo' });
+        
+        // If highest video doesn't work, try any video format
+        if (!format) {
+            format = info.formats.find(f => f.hasVideo && f.hasAudio) || info.formats[0];
+        }
+        
+        if (!format) {
+            throw new Error('No suitable video format found');
+        }
+        
+        logInfo('YOUTUBE', `Found video: ${info.videoDetails.title}`, { 
+            format: format.qualityLabel || 'unknown',
+            container: format.container,
+            size: format.contentLength ? `${(format.contentLength / 1024 / 1024).toFixed(2)} MB` : 'unknown'
+        });
+        
+        return {
+            url: format.url,
+            title: info.videoDetails.title,
+            quality: format.qualityLabel || 'unknown',
+            size: format.contentLength ? parseInt(format.contentLength) : null,
+            format: format.container
+        };
+        
+    } catch (error) {
+        logError('YOUTUBE_DOWNLOAD', error, { videoId });
+        
+        // Fallback: try using yt-dlp (requires yt-dlp installed on the system)
+        try {
+            logInfo('YOUTUBE', 'Trying yt-dlp fallback...');
+            
+            // Get video URL using yt-dlp
+            const { stdout } = await execPromise(
+                `yt-dlp -g -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" "https://www.youtube.com/watch?v=${videoId}"`
+            );
+            
+            const videoUrl = stdout.trim().split('\n')[0];
+            
+            if (!videoUrl) {
+                throw new Error('No video URL found via yt-dlp');
+            }
+            
+            return {
+                url: videoUrl,
+                title: `YouTube_Video_${videoId}`,
+                quality: 'best',
+                size: null,
+                format: 'mp4'
+            };
+            
+        } catch (ytDlpError) {
+            logError('YOUTUBE_YTD LP', ytDlpError, { videoId });
+            throw new Error('Failed to download YouTube video. Please ensure yt-dlp is installed or try again later.');
+        }
+    }
+}
 
 // =============================================================================
 // LINK EXTRACTORS FOR DIFFERENT SOURCES
@@ -395,7 +460,7 @@ class VidsrcExtractor {
     deduplicateLinks(links) {
         const seen = new Set();
         return links.filter(link => {
-            const key = link.url.split('?')[0]; // Remove query params for dedup
+            const key = link.url.split('?')[0];
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
@@ -965,8 +1030,8 @@ app.get('/api/health', (req, res) => {
 // -----------------------------------------------------------------------------
 app.get('/api/tmdb/*', async (req, res) => {
     try {
-        const tmdbPath = req.params[0];                       // e.g. "movie/popular"
-        const query    = { ...req.query, api_key: TMDB_KEY }; // merge caller's params + key
+        const tmdbPath = req.params[0];
+        const query    = { ...req.query, api_key: TMDB_KEY };
         const qs       = new URLSearchParams(query).toString();
         const url      = `${TMDB_BASE}/${tmdbPath}?${qs}`;
 
@@ -984,8 +1049,8 @@ app.get('/api/tmdb/*', async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get('/api/youtube/*', async (req, res) => {
     try {
-        const ytPath = req.params[0];                     // e.g. "search"
-        const query  = { ...req.query, key: YT_KEY };     // merge caller's params + key
+        const ytPath = req.params[0];
+        const query  = { ...req.query, key: YT_KEY };
         const qs     = new URLSearchParams(query).toString();
         const url    = `${YT_BASE}/${ytPath}?${qs}`;
 
@@ -998,31 +1063,113 @@ app.get('/api/youtube/*', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SPORTMONKS PROXY — injects api_token server-side, forwards any path + query params
-// Frontend calls: GET /api/sports/<path>?<params>
-// Short-cached (see sportsCache) so a room full of tabs polling livescores
-// doesn't multiply into that many hits against the SportMonks rate limit.
+// YOUTUBE DOWNLOAD ENDPOINT — Downloads actual video file
+// Frontend calls: GET /api/youtube/download?videoId=xxx
 // -----------------------------------------------------------------------------
-app.get('/api/sports/*', async (req, res) => {
+app.get('/api/youtube/download', async (req, res) => {
+    const videoId = req.query.videoId;
+    
+    if (!videoId) {
+        return res.status(400).json({ error: 'Video ID required' });
+    }
+    
     try {
-        const sportsPath = req.params[0];                             // e.g. "livescores/inplay"
-        const query      = { ...req.query, api_token: SPORTMONKS_KEY };
-        const qs         = new URLSearchParams(query).toString();
-        const url         = `${SPORTMONKS_BASE}/${sportsPath}?${qs}`;
-        const cacheKey    = url;
-
-        const cached = sportsCache.get(cacheKey);
-        if (cached) {
-            res.setHeader('X-Cache-Hit', 'true');
-            return res.json(cached);
+        logInfo('YOUTUBE_DOWNLOAD', `Downloading video: ${videoId}`);
+        
+        // Try using ytdl-core first (pure Node.js)
+        try {
+            const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+            const info = await ytdl.getInfo(videoUrl);
+            
+            // Get the best video format with audio
+            let format = ytdl.chooseFormat(info.formats, { 
+                quality: 'highestvideo',
+                filter: 'audioandvideo'
+            });
+            
+            // If no audio+video, try separate audio and video
+            if (!format) {
+                format = ytdl.chooseFormat(info.formats, { quality: 'highest' });
+            }
+            
+            if (!format) {
+                throw new Error('No suitable video format found');
+            }
+            
+            // Get the video stream
+            const stream = ytdl(videoUrl, { format });
+            
+            // Set headers for download
+            const filename = `${info.videoDetails.title.replace(/[^a-z0-9]/gi, '_')}.mp4`;
+            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            res.setHeader('Content-Type', 'video/mp4');
+            res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
+            
+            if (format.contentLength) {
+                res.setHeader('Content-Length', format.contentLength);
+            }
+            
+            // Pipe the video stream to the response
+            stream.pipe(res);
+            
+            stream.on('end', () => {
+                logInfo('YOUTUBE_DOWNLOAD', `Download completed: ${filename}`);
+            });
+            
+            stream.on('error', (error) => {
+                logError('YOUTUBE_STREAM', error);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Stream error' });
+                }
+            });
+            
+        } catch (ytdlError) {
+            logError('YOUTUBE_Y TDL', ytdlError);
+            
+            // Fallback: Try using yt-dlp (requires yt-dlp installed)
+            try {
+                logInfo('YOUTUBE', 'Falling back to yt-dlp...');
+                
+                // Get the video URL using yt-dlp
+                const { stdout } = await execPromise(
+                    `yt-dlp -g -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" "https://www.youtube.com/watch?v=${videoId}"`
+                );
+                
+                const videoUrl = stdout.trim().split('\n')[0];
+                
+                if (!videoUrl) {
+                    throw new Error('No video URL found');
+                }
+                
+                // Fetch the video and pipe it
+                const response = await axios({
+                    method: 'GET',
+                    url: videoUrl,
+                    responseType: 'stream',
+                    headers: {
+                        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
+                    }
+                });
+                
+                res.setHeader('Content-Disposition', `attachment; filename="youtube_${videoId}.mp4"`);
+                res.setHeader('Content-Type', 'video/mp4');
+                res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+                
+                response.data.pipe(res);
+                
+            } catch (ytDlpError) {
+                logError('YOUTUBE_YTD LP', ytDlpError);
+                throw new Error('Failed to download video. Please ensure yt-dlp is installed.');
+            }
         }
-
-        const response = await axios.get(url, { timeout: 10000 });
-        sportsCache.set(cacheKey, response.data);
-        res.json(response.data);
+        
     } catch (error) {
-        logError('SPORTMONKS_PROXY', error);
-        res.status(error.response?.status || 500).json(error.response?.data || { error: error.message });
+        logError('YOUTUBE_DOWNLOAD', error);
+        res.status(500).json({ 
+            error: 'Download failed', 
+            message: error.message,
+            details: 'Please ensure yt-dlp is installed or try again later.'
+        });
     }
 });
 
@@ -1041,6 +1188,55 @@ app.get('/api/movie/:id', async (req, res) => {
     } catch (error) {
         logError('API_MOVIE', error);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// =============================================================================
+// MEDIA METADATA + OFFICIAL TRAILER
+// =============================================================================
+app.get('/api/media/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const type = req.query.type === 'tv' ? 'tv' : 'movie';
+
+        const [detailsRes, videosRes] = await Promise.all([
+            axios.get(`${TMDB_BASE}/${type}/${id}?api_key=${TMDB_KEY}`),
+            axios.get(`${TMDB_BASE}/${type}/${id}/videos?api_key=${TMDB_KEY}`)
+        ]);
+
+        const d = detailsRes.data;
+        const title = d.title || d.name || 'Unknown';
+        const releaseDate = d.release_date || d.first_air_date || null;
+        const year = releaseDate ? new Date(releaseDate).getFullYear() : null;
+
+        const vids = videosRes.data.results || [];
+        const trailer =
+            vids.find(v => v.site === 'YouTube' && v.type === 'Trailer' && v.official) ||
+            vids.find(v => v.site === 'YouTube' && v.type === 'Trailer') ||
+            vids.find(v => v.site === 'YouTube' && v.type === 'Teaser') ||
+            null;
+
+        res.json({
+            id: d.id,
+            type,
+            title,
+            year,
+            overview: d.overview || '',
+            poster: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : null,
+            backdrop: d.backdrop_path ? `https://image.tmdb.org/t/p/w1280${d.backdrop_path}` : null,
+            rating: d.vote_average ?? null,
+            genres: (d.genres || []).map(g => g.name),
+            runtime: d.runtime ?? null,
+            trailer: trailer ? {
+                key: trailer.key,
+                name: trailer.name,
+                embedUrl: `https://www.youtube.com/embed/${trailer.key}`,
+                watchUrl: `https://www.youtube.com/watch?v=${trailer.key}`
+            } : null
+        });
+    } catch (error) {
+        logError('API_MEDIA', error);
+        res.status(error.response?.status || 500).json({ error: 'Failed to fetch media metadata' });
     }
 });
 
@@ -1206,12 +1402,13 @@ process.on('SIGINT', async () => {
 app.listen(PORT, HOST, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║              PLAYKIT Download Server v2.0                  ║
+║              STREAMNET Download Server v2.0                  ║
 ║   Real link extraction · Validation · Caching · Fallback   ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server: http://${HOST}:${PORT}                                ║
 ║  Cache: ${linkCache.keys().length} entries                         ║
 ║  Sources: vidsrc, embed, superembed, multisrc              ║
+║  YouTube: ytdl-core + yt-dlp fallback                     ║
 ╚════════════════════════════════════════════════════════════╝
     `);
 });
