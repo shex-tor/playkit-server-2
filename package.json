@@ -1,7 +1,7 @@
 {
-  "name": "playkit-server",
+  "name": "streamnet-server",
   "version": "1.0.0",
-  "description": "PLAYKIT Movie Download Server",
+  "description": "STREAMNET Movie Download Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,16 +9,13 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "ytdl-core": "^4.11.5",
-    "fluent-ffmpeg": "^2.1.2",
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "axios": "^1.6.2",
-    "axios-retry": "^3.7.0",
-    "cheerio": "^1.0.0-rc.12",
+    "axios-retry": "^4.0.0",
+    "cheerio": "^1.0.0",
     "node-cache": "^5.1.2",
-    "express-rate-limit": "^6.10.0",
-    "compression": "^1.7.4"
+    "express-rate-limit": "^7.1.5",
+    "compression": "^1.7.4",
+    "ytdl-core": "^4.11.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
