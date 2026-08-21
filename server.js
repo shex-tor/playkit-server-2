@@ -108,13 +108,25 @@ function loadCacheFromDisk() {
     }
 }
 
-// Save cache to disk periodically
+// Save cache to disk periodically.
+// Strip per-link `validated` / `checkedAt` stamps before writing — those are
+// only valid for the current server session.  When the server restarts and
+// reloads the disk cache, links will be re-validated before being served.
 function saveCacheToDisk() {
     try {
         const keys = linkCache.keys();
         const cacheData = {};
         keys.forEach(key => {
-            cacheData[key] = linkCache.get(key);
+            const entry = linkCache.get(key);
+            if (!entry) return;
+            const cleaned = {
+                ...entry,
+                sources: (entry.sources || []).map(src => ({
+                    ...src,
+                    links: (src.links || []).map(({ validated: _v, checkedAt: _c, ...rest }) => rest)
+                }))
+            };
+            cacheData[key] = cleaned;
         });
         fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2));
         console.log(`💾 Saved ${keys.length} links to disk cache`);
@@ -714,7 +726,10 @@ class LinkExtractor {
     }
 
     async extractLinks(movieId, title, year) {
-        const cacheKey = `movie_${movieId}_${year}`;
+        // Use the same key prefix as DownloadManager so both layers share one
+        // cache slot — previously movie_${id}_${year} vs links_${id} meant two
+        // separate entries and refreshCache never matched the live data.
+        const cacheKey = `links_${movieId}`;
         const cached = linkCache.get(cacheKey);
         
         if (cached) {
@@ -768,7 +783,7 @@ class LinkExtractor {
             primary: validatedLinks[0]?.links[0] || null
         };
 
-        // Cache the results
+        // Cache the results under the unified key
         linkCache.set(cacheKey, output);
         
         return output;
@@ -776,30 +791,33 @@ class LinkExtractor {
 
     async validateLinks(results) {
         const validated = [];
-        
+        const CONCURRENCY = 4; // check up to 4 links at once per source
+
         for (const sourceResult of results) {
+            const allLinks = sourceResult.links;
             const validLinks = [];
-            
-            for (const link of sourceResult.links) {
-                try {
-                    const isValid = await this.checkLink(link.url);
-                    if (isValid.valid) {
+
+            // Process in batches of CONCURRENCY instead of one-by-one with a
+            // hardcoded 500ms delay — cuts validation time from O(n*0.5s) to
+            // O(ceil(n/CONCURRENCY) * avg_check_time)
+            for (let i = 0; i < allLinks.length; i += CONCURRENCY) {
+                const batch = allLinks.slice(i, i + CONCURRENCY);
+                const batchResults = await Promise.allSettled(
+                    batch.map(link => this.checkLink(link.url))
+                );
+                batchResults.forEach((result, j) => {
+                    if (result.status === 'fulfilled' && result.value.valid) {
                         validLinks.push({
-                            ...link,
+                            ...batch[j],
                             validated: true,
                             checkedAt: Date.now(),
-                            size: isValid.size,
-                            contentType: isValid.contentType
+                            size: result.value.size,
+                            contentType: result.value.contentType
                         });
                     }
-                } catch (error) {
-                    logError('VALIDATE', error, { url: link.url });
-                }
-                
-                // Small delay to avoid rate limiting
-                await new Promise(r => setTimeout(r, 500));
+                });
             }
-            
+
             if (validLinks.length > 0) {
                 validated.push({
                     source: sourceResult.source,
@@ -807,7 +825,7 @@ class LinkExtractor {
                 });
             }
         }
-        
+
         return validated;
     }
 
@@ -815,31 +833,29 @@ class LinkExtractor {
         try {
             const response = await axios.head(url, {
                 timeout: 10000,
-                maxRedirects: 5,
+                maxRedirects: 5,          // axios handles redirects natively
+                validateStatus: s => s < 500, // treat 4xx as invalid, not throw
                 headers: {
                     'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
                 }
             });
-            
+
+            if (response.status >= 400) return { valid: false, status: response.status };
+
             const contentType = response.headers['content-type'] || '';
             const contentLength = response.headers['content-length'];
-            
-            // Check if it's a video file
-            const isValid = contentType.includes('video/') || 
+
+            const isValid = contentType.includes('video/') ||
                            url.match(/\.(mp4|mkv|avi|mov|webm)$/i) ||
-                           (contentLength && parseInt(contentLength) > 1024 * 1024); // > 1MB
-            
+                           (contentLength && parseInt(contentLength) > 1024 * 1024);
+
             return {
-                valid: isValid,
+                valid: !!isValid,
                 contentType,
                 size: contentLength ? parseInt(contentLength) : null,
                 status: response.status
             };
         } catch (error) {
-            if (error.response?.status === 302 || error.response?.status === 301) {
-                // Follow redirect
-                return this.checkLink(error.response.headers.location);
-            }
             return { valid: false, error: error.message };
         }
     }
@@ -1021,9 +1037,11 @@ class DownloadManager {
         return sorted;
     }
 
-    async initiateDownload(movieId, quality, title) {
+    async initiateDownload(movieId, quality, title, year = null) {
         try {
-            const links = await this.getDownloadLinks(movieId, title, null);
+            // Pass year so getDownloadLinks can form a cache key that matches
+            // the one LinkExtractor already wrote — previously always null here.
+            const links = await this.getDownloadLinks(movieId, title, year);
             
             // Try the requested quality first
             if (links.qualityOptions && links.qualityOptions[quality]) {
@@ -1107,13 +1125,24 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// TMDB Proxy
+// TMDB Proxy — key is injected here; frontend must never pass api_key directly.
+// Path is validated to avoid this endpoint being used as a general HTTP proxy.
+const TMDB_PATH_RE = /^[\w\-/]+$/; // only word chars, hyphens, slashes
+
 app.get('/api/tmdb/*', async (req, res) => {
     try {
         const tmdbPath = req.params[0];
-        const query    = { ...req.query, api_key: TMDB_KEY };
-        const qs       = new URLSearchParams(query).toString();
-        const url      = `${TMDB_BASE}/${tmdbPath}?${qs}`;
+
+        // Reject paths that look like external URLs or path traversal
+        if (!tmdbPath || !TMDB_PATH_RE.test(tmdbPath)) {
+            return res.status(400).json({ error: 'Invalid TMDB path' });
+        }
+
+        // Strip any api_key the client passed — we always inject ours
+        const { api_key: _dropped, ...safeQuery } = req.query;
+        const query = { ...safeQuery, api_key: TMDB_KEY };
+        const qs    = new URLSearchParams(query).toString();
+        const url   = `${TMDB_BASE}/${tmdbPath}?${qs}`;
 
         const response = await axios.get(url, { timeout: 10000 });
         res.json(response.data);
@@ -1328,12 +1357,12 @@ app.get('/api/download/options/:id', async (req, res) => {
 // Initiate download
 app.get('/api/download', async (req, res) => {
     try {
-        const { movieId, quality, title } = req.query;
+        const { movieId, quality, title, year } = req.query;
         if (!movieId || !quality || !title) {
             return res.status(400).json({ error: 'Missing required parameters: movieId, quality, title' });
         }
 
-        const downloadInfo = await downloadManager.initiateDownload(movieId, quality, title);
+        const downloadInfo = await downloadManager.initiateDownload(movieId, quality, title, year || null);
         if (!downloadInfo || !downloadInfo.url) {
             return res.status(404).json({ error: 'No working download link found for this quality' });
         }
@@ -1362,6 +1391,29 @@ app.get('/api/download', async (req, res) => {
     }
 });
 
+// Allowed CDN hostnames for the download proxy — prevents SSRF.
+// Extend this list as you add legitimate sources; never use a wildcard.
+const PROXY_ALLOWED_HOSTS = new Set([
+    'netnaija.com', 'www.netnaija.com',
+    'fzmovies.net', 'www.fzmovies.net',
+    'vidsrc.to', 'vidsrc.me',
+    'image.tmdb.org',
+    'images.weserv.nl',
+]);
+
+// Private/loopback CIDR blocks — requests to these are always rejected
+const PRIVATE_IP_RE = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|::1|fc00:|fe80:)/i;
+
+function isProxyUrlAllowed(rawUrl) {
+    let parsed;
+    try { parsed = new URL(rawUrl); } catch { return false; }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (PRIVATE_IP_RE.test(host)) return false;
+    // Allow exact match or subdomain of any allowed host
+    return [...PROXY_ALLOWED_HOSTS].some(h => host === h || host.endsWith('.' + h));
+}
+
 // Proxy download (for CORS issues)
 app.get('/api/download/proxy', async (req, res) => {
     try {
@@ -1369,12 +1421,9 @@ app.get('/api/download/proxy', async (req, res) => {
         if (!url) return res.status(400).json({ error: 'Missing URL parameter' });
 
         const decodedUrl = decodeURIComponent(url);
-        
-        // Validate URL
-        try {
-            new URL(decodedUrl);
-        } catch (e) {
-            return res.status(400).json({ error: 'Invalid URL' });
+
+        if (!isProxyUrlAllowed(decodedUrl)) {
+            return res.status(403).json({ error: 'URL not permitted by proxy allowlist' });
         }
 
         const response = await axios({
@@ -1437,18 +1486,21 @@ app.post('/api/cache/clear', (req, res) => {
 async function refreshCache() {
     const keys = linkCache.keys();
     const refreshKeys = keys.filter(key => {
+        if (!key.startsWith('links_')) return false; // only process unified-key entries
         const value = linkCache.get(key);
-        return Date.now() - (value.timestamp || 0) > 6 * 60 * 60 * 1000;
+        return Date.now() - (value?.timestamp || 0) > 6 * 60 * 60 * 1000;
     });
 
     for (const key of refreshKeys.slice(0, 5)) {
         try {
             const movieId = key.replace('links_', '');
             logInfo('REFRESH', `Refreshing cache for ${movieId}`);
-            
+
             let title, year;
             try {
-                const movieRes = await axios.get(`${TMDB_BASE}/movie/${movieId}?api_key=${TMDB_KEY}`);
+                // Use axiosWithProxy (retry-enabled) not bare axios — bare axios
+                // skips the retry config and stalls the background job on TMDB hiccups
+                const movieRes = await axiosWithProxy.get(`${TMDB_BASE}/movie/${movieId}?api_key=${TMDB_KEY}`);
                 const movie = movieRes.data;
                 title = movie.title;
                 year = new Date(movie.release_date).getFullYear();
