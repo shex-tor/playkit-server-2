@@ -12,7 +12,6 @@ const axiosRetry = require('axios-retry').default;
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const NodeCache = require('node-cache');
-const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const os = require('os');
 const { URL } = require('url');
@@ -46,14 +45,6 @@ app.use((req, res, next) => {
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static('public'));
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100,
-    message: { error: 'Too many requests, please try again later.' }
-});
-app.use('/api/', limiter);
 
 // =============================================================================
 // CONFIGURATION — API keys live here only, never in the frontend
